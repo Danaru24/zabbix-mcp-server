@@ -1,27 +1,51 @@
+# Zabbix MCP Server - OpenShift friendly
+# Arranque: 1) corre test_server.py  2) si pasa, levanta start_server.py y se queda corriendo
+
 FROM python:3.13-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Dependencias mínimas (por si alguna lib requiere compilar wheels)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Instala uv
+RUN pip install --no-cache-dir uv
 
-# Copy application files
+# Copia metadata primero para aprovechar cache de build
+COPY pyproject.toml uv.lock ./
+
+# Instala dependencias con uv (crea .venv)
+RUN uv sync --no-editable
+
+# Copia código
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-# Create non-root user
-RUN useradd -m -u 1000 mcpuser && chown -R mcpuser:mcpuser /app
-USER mcpuser
+# Script de arranque: test -> start (en foreground)
+RUN cat > /app/entrypoint.sh << 'EOF' && chmod +x /app/entrypoint.sh
+#!/usr/bin/env sh
+set -eu
 
-# Expose MCP port
+echo "==> (1/2) Running preflight test: scripts/test_server.py"
+uv run python scripts/test_server.py
+
+echo "==> (2/2) Starting server: scripts/start_server.py"
+exec uv run python scripts/start_server.py
+EOF
+
+# OpenShift: UID arbitrario (grupo 0) y permisos compatibles
+RUN chgrp -R 0 /app && chmod -R g=u /app
+
+# Evita escrituras en /root en runtime
+ENV HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    UV_CACHE_DIR=/tmp/uv-cache \
+    PYTHONUNBUFFERED=1
+
 EXPOSE 8000
 
-# Run the server in SSE mode
-CMD ["python", "-c", "import sys; sys.path.insert(0, 'src'); from zabbix_mcp_server import mcp; mcp.run(transport='sse', host='0.0.0.0', port=8000)"]
+CMD ["/app/entrypoint.sh"]
