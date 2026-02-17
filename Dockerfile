@@ -25,17 +25,18 @@ COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-# Script de arranque: test -> start (en foreground)
-RUN cat > /app/entrypoint.sh << 'EOF' && chmod +x /app/entrypoint.sh
-#!/usr/bin/env sh
-set -eu
-
-echo "==> (1/2) Running preflight test: scripts/test_server.py"
-uv run python scripts/test_server.py
-
-echo "==> (2/2) Starting server: scripts/start_server.py"
-exec uv run python scripts/start_server.py
-EOF
+# Crea entrypoint sin heredoc (compatible con buildah/podman)
+RUN printf '%s\n' \
+  '#!/usr/bin/env sh' \
+  'set -eu' \
+  '' \
+  'echo "==> (1/2) Running preflight test: scripts/test_server.py"' \
+  'uv run python scripts/test_server.py' \
+  '' \
+  'echo "==> (2/2) Starting server: scripts/start_server.py"' \
+  'exec uv run python scripts/start_server.py' \
+  > /app/entrypoint.sh \
+  && chmod +x /app/entrypoint.sh
 
 # OpenShift: UID arbitrario (grupo 0) y permisos compatibles
 RUN chgrp -R 0 /app && chmod -R g=u /app
