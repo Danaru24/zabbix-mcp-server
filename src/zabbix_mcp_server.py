@@ -17,7 +17,8 @@ from typing import Any, Dict, List, Optional, Union
 from fastmcp import FastMCP
 from zabbix_utils import ZabbixAPI
 from dotenv import load_dotenv
-
+import time
+from statistics import mean
 # Load environment variables from .env file
 load_dotenv()
 
@@ -28,8 +29,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+
+
+
 # Initialize FastMCP
 mcp = FastMCP("Zabbix MCP Server")
+
+
 
 # Global Zabbix API client
 zabbix_api: Optional[ZabbixAPI] = None
@@ -1522,6 +1529,324 @@ def get_transport_config() -> Dict[str, Any]:
         logger.info(f"HTTP transport configured: {config['host']}:{config['port']}, stateless_http={config['stateless_http']}")
     
     return config
+
+
+
+@mcp.tool()
+def zabbix_host_list_simple() -> str:
+    """
+    Lista los hosts de Zabbix (hostid y host) de forma simple para n8n.
+    No recibe parámetros para que el MCP Client de n8n no se rompa.
+    """
+    client = get_zabbix_client()
+
+    params = {
+        "output": ["hostid", "host"],
+    }
+
+    result = client.host.get(**params)
+    return format_response(result)
+
+
+@mcp.tool()
+def zabbix_alerts_simple() -> str:
+
+
+    client = get_zabbix_client()
+
+    # 1. Obtener todos los hosts
+    hosts = client.host.get(output=["hostid", "host"])
+
+    alerts = []
+
+    # 2. Para cada host consultar problemas activos
+    for h in hosts:
+        hostid = h["hostid"]
+        hostname = h["host"]
+
+        problems = client.problem.get(
+            hostids=[hostid],
+            output=["eventid", "name", "severity", "clock"],
+            recent=True
+        )
+
+        # 3. Incluir problemas en lista final
+        for p in problems:
+            alerts.append({
+                "host": hostname,
+                "eventid": p["eventid"],
+                "severity": int(p["severity"]),
+                "name": p["name"],
+                "timestamp": p["clock"]
+            })
+
+    return format_response(alerts)
+
+
+def _period_to_seconds(period: str) -> int:
+    """
+    Convierte periodos tipo demo: 30m / 1h a segundos.
+    Default: 30m
+    """
+    p = (period or "30m").strip().lower()
+    if p in ("30m", "30min", "30mins", "30 minutes", "30 minutos"):
+        return 30 * 60
+    if p in ("1h", "1hr", "60m", "60min", "1 hora"):
+        return 60 * 60
+    # Default demo-safe
+    return 30 * 60
+
+
+def _history_type_from_value_type(value_type: str) -> int:
+    """
+    Mapea value_type (Zabbix item) a history type (Zabbix history.get).
+    history types:
+      0=float, 1=character, 2=log, 3=unsigned, 4=text
+    Para porcentajes casi siempre es 0 (float) o 3 (unsigned).
+    """
+    vt = str(value_type) if value_type is not None else "3"
+    return 0 if vt == "0" else 3
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _get_hostid_by_host(client, host: str) -> Optional[str]:
+    """
+    Resuelve hostid usando host.get con filter exacto.
+    (Sin host_get para evitar ruido/validación en n8n)
+    """
+    host = (host or "").strip()
+    if not host:
+        return None
+
+    res = client.host.get(
+        output=["hostid", "host"],
+        filter={"host": host},
+        limit=1
+    )
+    if not res:
+        return None
+    return res[0].get("hostid")
+
+
+def _find_item_by_keys(client, hostid: str, keys: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Busca el primer item que coincida con alguna key_ en 'keys' usando search.
+    Devuelve el item dict con itemid, key_, value_type, units, etc.
+    """
+    for k in keys:
+        items = client.item.get(
+            hostids=[hostid],
+            output=["itemid", "name", "key_", "value_type", "units"],
+            search={"key_": k},
+            limit=1
+        )
+        if items:
+            return items[0]
+    return None
+
+
+@mcp.tool()
+def zabbix_ram_simple(host: str, period: str = "30m") -> str:
+    """
+    Demo-safe: devuelve RAM USADA (%) promedio y pico para un host en un periodo corto.
+    
+    Estrategia:
+      - Resuelve hostid con host.get(filter={"host": host})
+      - Encuentra item RAM preferido:
+          1) vm.memory.size[pavailable]  (porcentaje disponible)
+          2) vm.memory.size[available]   (a veces es bytes, depende template)
+      - Lee history en rango y calcula:
+          ram_used = 100 - pavailable
+      - Regresa JSON compacto: host, period, ram_used_avg, ram_used_max, unit
+    """
+    client = get_zabbix_client()
+
+    host_clean = (host or "").strip()
+    if not host_clean:
+        return format_response({"error": "host es requerido"})
+
+    # 1) Resolver hostid
+    hostid = _get_hostid_by_host(client, host_clean)
+    if not hostid:
+        return format_response({"error": f"Host no encontrado: {host_clean}"})
+
+    # 2) Encontrar item de memoria
+    # Nota: pavailable es el más útil para porcentaje.
+    item = _find_item_by_keys(
+        client,
+        hostid,
+        keys=[
+            "vm.memory.size[pavailable]",
+            "vm.memory.size[available]",
+        ]
+    )
+
+    if not item:
+        return format_response({"error": f"No encontré item de RAM compatible en {host_clean}"})
+
+    itemid = item.get("itemid")
+    if not itemid:
+        return format_response({"error": f"Item inválido para RAM en {host_clean}"})
+
+    history_type = _history_type_from_value_type(item.get("value_type"))
+
+    # 3) Leer history del periodo
+    now = int(time.time())
+    sec = _period_to_seconds(period)
+
+    rows = client.history.get(
+        itemids=[itemid],
+        history=history_type,
+        time_from=now - sec,
+        time_till=now,
+        sortfield="clock",
+        sortorder="DESC",
+        limit=200
+    )
+
+    if not rows:
+        return format_response({"error": f"Sin datos de RAM para {host_clean} en {period}"})
+
+    # 4) Parsear valores numéricos
+    vals = []
+    for r in rows:
+        fv = _safe_float(r.get("value"))
+        if fv is not None:
+            vals.append(fv)
+
+    if not vals:
+        return format_response({"error": f"Sin valores numéricos de RAM para {host_clean} en {period}"})
+
+    # 5) Convertir a RAM usada (%)
+    # Asumimos pavailable (% disponible). Si el template devuelve algo distinto,
+    # lo notarás porque los valores no estarán en 0-100.
+    used_vals = []
+    for v in vals:
+        # clamp conservador
+        if v < 0 or v > 1000:
+            continue
+        if v > 100:
+            # si viene raro, lo descartamos
+            continue
+        used_vals.append(max(0.0, min(100.0, 100.0 - v)))
+
+    if not used_vals:
+        return format_response({"error": f"Valores de RAM fuera de rango para {host_clean} en {period}"})
+
+    out = {
+        "host": host_clean,
+        "period": (period or "30m").strip(),
+        "ram_used_avg": round(mean(used_vals), 2),
+        "ram_used_max": round(max(used_vals), 2),
+        "unit": "%"
+    }
+    return format_response(out)
+
+@mcp.tool()
+def zabbix_cpu_simple(host: str, period: str = "30m") -> str:
+    """
+    Demo-safe: devuelve CPU USADA (%) promedio y pico para un host en un periodo corto.
+
+    Estrategia:
+      - Resuelve hostid con host.get(filter={"host": host})
+      - Encuentra item de CPU preferido:
+          1) system.cpu.util[,idle]  (idle %, CPU usada = 100 - idle)
+          2) system.cpu.util         (algunos templates exponen CPU util directo)
+          3) system.cpu.util[,user]  (CPU user %, aproximación)
+      - Lee history en rango y calcula avg/max
+      - Regresa JSON compacto: host, period, cpu_used_avg, cpu_used_max, unit
+    """
+    client = get_zabbix_client()
+
+    host_clean = (host or "").strip()
+    if not host_clean:
+        return format_response({"error": "host es requerido"})
+
+    # 1) Resolver hostid
+    hostid = _get_hostid_by_host(client, host_clean)
+    if not hostid:
+        return format_response({"error": f"Host no encontrado: {host_clean}"})
+
+    # 2) Encontrar item CPU
+    keys = [
+        "system.cpu.util[,idle]",
+        "system.cpu.util",
+        "system.cpu.util[,user]",
+    ]
+    item = _find_item_by_keys(client, hostid, keys)
+
+    if not item:
+        return format_response({"error": f"No encontré item de CPU compatible en {host_clean}"})
+
+    itemid = item.get("itemid")
+    key_ = (item.get("key_") or "").strip()
+    if not itemid:
+        return format_response({"error": f"Item inválido para CPU en {host_clean}"})
+
+    history_type = _history_type_from_value_type(item.get("value_type"))
+
+    # 3) Leer history del periodo
+    now = int(time.time())
+    sec = _period_to_seconds(period)
+
+    rows = client.history.get(
+        itemids=[itemid],
+        history=history_type,
+        time_from=now - sec,
+        time_till=now,
+        sortfield="clock",
+        sortorder="DESC",
+        limit=200
+    )
+
+    if not rows:
+        return format_response({"error": f"Sin datos de CPU para {host_clean} en {period}"})
+
+    # 4) Parsear valores numéricos
+    vals = []
+    for r in rows:
+        fv = _safe_float(r.get("value"))
+        if fv is not None:
+            vals.append(fv)
+
+    if not vals:
+        return format_response({"error": f"Sin valores numéricos de CPU para {host_clean} en {period}"})
+
+    # 5) Convertir a CPU usada (%)
+    # - Si tenemos idle: used = 100 - idle
+    # - Si ya es util/user: usamos el valor directo
+    used_vals = []
+    for v in vals:
+        if v < 0 or v > 1000:
+            continue
+        if "idle" in key_.lower():
+            if v > 100:
+                continue
+            used_vals.append(max(0.0, min(100.0, 100.0 - v)))
+        else:
+            # asumimos que ya viene como porcentaje de uso/actividad
+            if v > 100:
+                continue
+            used_vals.append(max(0.0, min(100.0, v)))
+
+    if not used_vals:
+        return format_response({"error": f"Valores de CPU fuera de rango para {host_clean} en {period}"})
+
+    out = {
+        "host": host_clean,
+        "period": (period or "30m").strip(),
+        "cpu_used_avg": round(mean(used_vals), 2),
+        "cpu_used_max": round(max(used_vals), 2),
+        "unit": "%"
+    }
+    return format_response(out)
+
 
 
 def main():
