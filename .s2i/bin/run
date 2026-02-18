@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Running preflight test"
+uv run python scripts/test_server.py
+
+echo "==> Starting server"
+exec uv run python scripts/start_server.py

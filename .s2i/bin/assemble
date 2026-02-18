@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Installing uv"
+python -m pip install --no-cache-dir uv
+
+echo "==> Installing dependencies"
+uv sync --no-editable
