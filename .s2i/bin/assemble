@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+APP_ROOT="/opt/app-root/src"
+
+echo "==> Copying source from /tmp/src to ${APP_ROOT}"
+cp -R /tmp/src/. "${APP_ROOT}/"
+
+cd "${APP_ROOT}"
+
 echo "==> Installing uv"
 python -m pip install --no-cache-dir uv
 

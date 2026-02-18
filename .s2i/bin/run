@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd /opt/app-root/src
+
 echo "==> Running preflight test"
 uv run python scripts/test_server.py
 
