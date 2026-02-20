@@ -120,7 +120,7 @@ def show_configuration() -> None:
     logger.info(f"Transport: {transport}")
     
     if transport == 'streamable-http':
-        host = os.getenv('ZABBIX_MCP_HOST', '127.0.0.1')
+        host = os.getenv('ZABBIX_MCP_HOST', '0.0.0.0')
         port = os.getenv('ZABBIX_MCP_PORT', '8000')
         stateless = os.getenv('ZABBIX_MCP_STATELESS_HTTP', 'false')
         auth_type = os.getenv('AUTH_TYPE', 'Not set')
